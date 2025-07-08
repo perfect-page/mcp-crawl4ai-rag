@@ -10,7 +10,11 @@ from urllib.parse import urlparse
 import openai
 import re
 import time
-from .openai_wrapper import OpenAIWrapper, call_openai_with_retries
+try:
+    from .openai_wrapper import OpenAIWrapper, call_openai_with_retries
+except ImportError:
+    # Fallback for direct script execution
+    from openai_wrapper import OpenAIWrapper, call_openai_with_retries
 
 # Load OpenAI API key for embeddings
 openai.api_key = os.getenv("OPENAI_API_KEY")

@@ -48,6 +48,39 @@ The Crawl4AI RAG MCP server is just the beginning. Here's where we're headed:
 - **Vector Search**: Performs RAG over crawled content, optionally filtering by data source for precision
 - **Source Retrieval**: Retrieve sources available for filtering to guide the RAG process
 
+## OpenAI API Integration
+
+The system includes a robust OpenAI API wrapper (`src/openai_wrapper.py`) that provides enterprise-grade reliability for all OpenAI API calls:
+
+### Key Features:
+- **Automatic Rate Limiting**: Proactive rate limiting using `pyrate-limiter` to prevent hitting OpenAI's limits
+- **Infinite Retries**: Automatic retry with exponential backoff (1-60 seconds) for failed API calls
+- **Live Progress Tracking**: Real-time progress bars with `tqdm` showing completion and error counts
+- **Error Monitoring**: Comprehensive error tracking by HTTP status code with final summary reports
+- **Parallel Processing**: Support for concurrent API calls with configurable limits
+
+### Configuration:
+Set these environment variables to customize rate limits:
+```bash
+OPENAI_RPM_LIMIT=60          # Requests per minute (default: 60)
+OPENAI_TPM_LIMIT=150000      # Tokens per minute (default: 150000)
+```
+
+### Example Output:
+During batch operations, you'll see live progress like:
+```
+Creating embeddings: 45/100 [45%] ██████████░░░░░░░░░░ 
+completed: 42, err_429: 3, err_500: 0
+```
+
+The wrapper ensures 100% delivery success for all OpenAI API calls, making it safe for large-scale crawling and RAG operations.
+
+### Testing the OpenAI Wrapper:
+To see the OpenAI wrapper in action with all its features, run the demo script:
+```bash
+python src/demo_openai_wrapper.py
+```
+
 ## Tools
 
 The server provides essential web crawling and search tools:
@@ -76,6 +109,13 @@ The server provides essential web crawling and search tools:
 - [Supabase](https://supabase.com/) (database for RAG)
 - [OpenAI API key](https://platform.openai.com/api-keys) (for generating embeddings)
 - [Neo4j](https://neo4j.com/) (optional, for knowledge graph functionality) - see [Knowledge Graph Setup](#knowledge-graph-setup) section
+
+### Python Dependencies
+
+The project uses several key dependencies for robust API handling:
+- `tenacity` - For automatic retries with exponential backoff
+- `tqdm` - For live progress bars during batch operations
+- `pyrate-limiter` - For proactive rate limiting
 
 ## Installation
 
@@ -187,6 +227,8 @@ TRANSPORT=sse
 
 # OpenAI API Configuration
 OPENAI_API_KEY=your_openai_api_key
+OPENAI_RPM_LIMIT=60          # Optional: Requests per minute limit (default: 60)
+OPENAI_TPM_LIMIT=150000      # Optional: Tokens per minute limit (default: 150000)
 
 # LLM for summaries and contextual embeddings
 MODEL_CHOICE=gpt-4.1-nano
