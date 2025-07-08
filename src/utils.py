@@ -5,14 +5,22 @@ import os
 import concurrent.futures
 from typing import List, Dict, Any, Optional, Tuple
 import json
+import logging
 from supabase import create_client, Client
 from urllib.parse import urlparse
-import openai
 import re
 import time
 
-# Load OpenAI API key for embeddings
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Import the robust OpenAI wrapper
+from .openai_wrapper import (
+    create_embeddings_with_progress,
+    call_openai_chat_completion,
+    print_error_summary,
+    reset_error_counter
+)
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 def get_supabase_client() -> Client:
     """
@@ -31,7 +39,7 @@ def get_supabase_client() -> Client:
 
 def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
-    Create embeddings for multiple texts in a single API call.
+    Create embeddings for multiple texts using the robust OpenAI wrapper.
     
     Args:
         texts: List of texts to create embeddings for
@@ -42,44 +50,18 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     if not texts:
         return []
     
-    max_retries = 3
-    retry_delay = 1.0  # Start with 1 second delay
-    
-    for retry in range(max_retries):
-        try:
-            response = openai.embeddings.create(
-                model="text-embedding-3-small", # Hardcoding embedding model for now, will change this later to be more dynamic
-                input=texts
-            )
-            return [item.embedding for item in response.data]
-        except Exception as e:
-            if retry < max_retries - 1:
-                print(f"Error creating batch embeddings (attempt {retry + 1}/{max_retries}): {e}")
-                print(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-            else:
-                print(f"Failed to create batch embeddings after {max_retries} attempts: {e}")
-                # Try creating embeddings one by one as fallback
-                print("Attempting to create embeddings individually...")
-                embeddings = []
-                successful_count = 0
-                
-                for i, text in enumerate(texts):
-                    try:
-                        individual_response = openai.embeddings.create(
-                            model="text-embedding-3-small",
-                            input=[text]
-                        )
-                        embeddings.append(individual_response.data[0].embedding)
-                        successful_count += 1
-                    except Exception as individual_error:
-                        print(f"Failed to create embedding for text {i}: {individual_error}")
-                        # Add zero embedding as fallback
-                        embeddings.append([0.0] * 1536)
-                
-                print(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
-                return embeddings
+    try:
+        # Use the robust wrapper with progress tracking and retry logic
+        embeddings = create_embeddings_with_progress(
+            texts=texts,
+            model="text-embedding-3-small",
+            batch_size=100  # Process in batches of 100
+        )
+        return embeddings
+    except Exception as e:
+        logger.error(f"Failed to create embeddings even with robust retry logic: {e}")
+        # Return zero embeddings as fallback
+        return [[0.0] * 1536] * len(texts)
 
 def create_embedding(text: str) -> List[float]:
     """
@@ -112,8 +94,6 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
         - The contextual text that situates the chunk within the document
         - Boolean indicating if contextual embedding was performed
     """
-    model_choice = os.getenv("MODEL_CHOICE")
-    
     try:
         # Create the prompt for generating contextual information
         prompt = f"""<document> 
@@ -125,19 +105,17 @@ Here is the chunk we want to situate within the whole document
 </chunk> 
 Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
 
-        # Call the OpenAI API to generate contextual information
-        response = openai.chat.completions.create(
-            model=model_choice,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
-                {"role": "user", "content": prompt}
-            ],
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
+            {"role": "user", "content": prompt}
+        ]
+
+        # Use the robust wrapper for chat completion
+        context = call_openai_chat_completion(
+            messages=messages,
             temperature=0.3,
             max_tokens=200
         )
-        
-        # Extract the generated context
-        context = response.choices[0].message.content.strip()
         
         # Combine the context with the original chunk
         contextual_text = f"{context}\n---\n{chunk}"
@@ -145,7 +123,7 @@ Please give a short succinct context to situate this chunk within the overall do
         return contextual_text, True
     
     except Exception as e:
-        print(f"Error generating contextual embedding: {e}. Using original chunk instead.")
+        logger.error(f"Error generating contextual embedding: {e}. Using original chunk instead.")
         return chunk, False
 
 def process_chunk_with_context(args):
@@ -176,6 +154,7 @@ def add_documents_to_supabase(
     """
     Add documents to the Supabase crawled_pages table in batches.
     Deletes existing records with the same URLs before inserting to prevent duplicates.
+    Uses robust OpenAI wrapper with progress tracking and error reporting.
     
     Args:
         client: Supabase client
@@ -186,6 +165,10 @@ def add_documents_to_supabase(
         url_to_full_document: Dictionary mapping URLs to their full document content
         batch_size: Size of each batch for insertion
     """
+    # Reset error counter for this operation
+    reset_error_counter()
+    
+    logger.info(f"Processing {len(contents)} documents for embedding and storage")
     # Get unique URLs to delete existing records
     unique_urls = list(set(urls))
     
@@ -312,7 +295,11 @@ def add_documents_to_supabase(
                             print(f"Failed to insert individual record for URL {record['url']}: {individual_error}")
                     
                     if successful_inserts > 0:
-                        print(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
+                        logger.info(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
+    
+    # Print error summary at the end of processing
+    logger.info("Document processing completed")
+    print_error_summary()
 
 def search_documents(
     client: Client, 
@@ -449,8 +436,6 @@ def generate_code_example_summary(code: str, context_before: str, context_after:
     Returns:
         A summary of what the code example demonstrates
     """
-    model_choice = os.getenv("MODEL_CHOICE")
-    
     # Create the prompt
     prompt = f"""<context_before>
 {context_before[-500:] if len(context_before) > 500 else context_before}
@@ -468,20 +453,20 @@ Based on the code example and its surrounding context, provide a concise summary
 """
     
     try:
-        response = openai.chat.completions.create(
-            model=model_choice,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that provides concise code example summaries."},
-                {"role": "user", "content": prompt}
-            ],
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that provides concise code example summaries."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        # Use the robust wrapper for chat completion
+        return call_openai_chat_completion(
+            messages=messages,
             temperature=0.3,
             max_tokens=100
         )
-        
-        return response.choices[0].message.content.strip()
     
     except Exception as e:
-        print(f"Error generating code example summary: {e}")
+        logger.error(f"Error generating code example summary: {e}")
         return "Code example for demonstration purposes."
 
 
@@ -496,6 +481,7 @@ def add_code_examples_to_supabase(
 ):
     """
     Add code examples to the Supabase code_examples table in batches.
+    Uses robust OpenAI wrapper with progress tracking and error reporting.
     
     Args:
         client: Supabase client
@@ -508,6 +494,11 @@ def add_code_examples_to_supabase(
     """
     if not urls:
         return
+    
+    # Reset error counter for this operation
+    reset_error_counter()
+    
+    logger.info(f"Processing {len(code_examples)} code examples for embedding and storage")
         
     # Delete existing records for these URLs
     unique_urls = list(set(urls))
@@ -590,8 +581,12 @@ def add_code_examples_to_supabase(
                             print(f"Failed to insert individual record for URL {record['url']}: {individual_error}")
                     
                     if successful_inserts > 0:
-                        print(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
-        print(f"Inserted batch {i//batch_size + 1} of {(total_items + batch_size - 1)//batch_size} code examples")
+                        logger.info(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
+        logger.info(f"Inserted batch {i//batch_size + 1} of {(total_items + batch_size - 1)//batch_size} code examples")
+    
+    # Print error summary at the end of processing
+    logger.info("Code examples processing completed")
+    print_error_summary()
 
 
 def update_source_info(client: Client, source_id: str, summary: str, word_count: int):
@@ -647,9 +642,6 @@ def extract_source_summary(source_id: str, content: str, max_length: int = 500) 
     if not content or len(content.strip()) == 0:
         return default_summary
     
-    # Get the model choice from environment variables
-    model_choice = os.getenv("MODEL_CHOICE")
-    
     # Limit content length to avoid token limits
     truncated_content = content[:25000] if len(content) > 25000 else content
     
@@ -662,19 +654,17 @@ The above content is from the documentation for '{source_id}'. Please provide a 
 """
     
     try:
-        # Call the OpenAI API to generate the summary
-        response = openai.chat.completions.create(
-            model=model_choice,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that provides concise library/tool/framework summaries."},
-                {"role": "user", "content": prompt}
-            ],
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that provides concise library/tool/framework summaries."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        # Use the robust wrapper for chat completion
+        summary = call_openai_chat_completion(
+            messages=messages,
             temperature=0.3,
             max_tokens=150
         )
-        
-        # Extract the generated summary
-        summary = response.choices[0].message.content.strip()
         
         # Ensure the summary is not too long
         if len(summary) > max_length:
@@ -683,7 +673,7 @@ The above content is from the documentation for '{source_id}'. Please provide a 
         return summary
     
     except Exception as e:
-        print(f"Error generating summary with LLM for {source_id}: {e}. Using default summary.")
+        logger.error(f"Error generating summary with LLM for {source_id}: {e}. Using default summary.")
         return default_summary
 
 
