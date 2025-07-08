@@ -10,9 +10,20 @@ from urllib.parse import urlparse
 import openai
 import re
 import time
+from .openai_wrapper import OpenAIWrapper, call_openai_with_retries
 
 # Load OpenAI API key for embeddings
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Create a global OpenAI wrapper instance for reuse
+_openai_wrapper = None
+
+def get_openai_wrapper() -> OpenAIWrapper:
+    """Get or create a singleton OpenAI wrapper instance."""
+    global _openai_wrapper
+    if _openai_wrapper is None:
+        _openai_wrapper = OpenAIWrapper(show_progress=False)  # Disable progress for utils
+    return _openai_wrapper
 
 def get_supabase_client() -> Client:
     """
@@ -42,44 +53,13 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     if not texts:
         return []
     
-    max_retries = 3
-    retry_delay = 1.0  # Start with 1 second delay
-    
-    for retry in range(max_retries):
-        try:
-            response = openai.embeddings.create(
-                model="text-embedding-3-small", # Hardcoding embedding model for now, will change this later to be more dynamic
-                input=texts
-            )
-            return [item.embedding for item in response.data]
-        except Exception as e:
-            if retry < max_retries - 1:
-                print(f"Error creating batch embeddings (attempt {retry + 1}/{max_retries}): {e}")
-                print(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-            else:
-                print(f"Failed to create batch embeddings after {max_retries} attempts: {e}")
-                # Try creating embeddings one by one as fallback
-                print("Attempting to create embeddings individually...")
-                embeddings = []
-                successful_count = 0
-                
-                for i, text in enumerate(texts):
-                    try:
-                        individual_response = openai.embeddings.create(
-                            model="text-embedding-3-small",
-                            input=[text]
-                        )
-                        embeddings.append(individual_response.data[0].embedding)
-                        successful_count += 1
-                    except Exception as individual_error:
-                        print(f"Failed to create embedding for text {i}: {individual_error}")
-                        # Add zero embedding as fallback
-                        embeddings.append([0.0] * 1536)
-                
-                print(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
-                return embeddings
+    # Use the OpenAI wrapper for robust handling
+    wrapper = get_openai_wrapper()
+    return wrapper.create_embeddings_batch(
+        texts,
+        model="text-embedding-3-small",
+        batch_size=100  # Process 100 texts per API call
+    )
 
 def create_embedding(text: str) -> List[float]:
     """
@@ -92,8 +72,8 @@ def create_embedding(text: str) -> List[float]:
         List of floats representing the embedding
     """
     try:
-        embeddings = create_embeddings_batch([text])
-        return embeddings[0] if embeddings else [0.0] * 1536
+        wrapper = get_openai_wrapper()
+        return wrapper.create_embedding(text, model="text-embedding-3-small")
     except Exception as e:
         print(f"Error creating embedding: {e}")
         # Return empty embedding if there's an error
@@ -125,19 +105,17 @@ Here is the chunk we want to situate within the whole document
 </chunk> 
 Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
 
-        # Call the OpenAI API to generate contextual information
-        response = openai.chat.completions.create(
-            model=model_choice,
+        # Use the OpenAI wrapper for robust handling
+        wrapper = get_openai_wrapper()
+        context = wrapper.chat_completion(
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
                 {"role": "user", "content": prompt}
             ],
+            model=model_choice,
             temperature=0.3,
             max_tokens=200
         )
-        
-        # Extract the generated context
-        context = response.choices[0].message.content.strip()
         
         # Combine the context with the original chunk
         contextual_text = f"{context}\n---\n{chunk}"
@@ -468,17 +446,16 @@ Based on the code example and its surrounding context, provide a concise summary
 """
     
     try:
-        response = openai.chat.completions.create(
-            model=model_choice,
+        wrapper = get_openai_wrapper()
+        return wrapper.chat_completion(
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise code example summaries."},
                 {"role": "user", "content": prompt}
             ],
+            model=model_choice,
             temperature=0.3,
             max_tokens=100
         )
-        
-        return response.choices[0].message.content.strip()
     
     except Exception as e:
         print(f"Error generating code example summary: {e}")
@@ -662,19 +639,17 @@ The above content is from the documentation for '{source_id}'. Please provide a 
 """
     
     try:
-        # Call the OpenAI API to generate the summary
-        response = openai.chat.completions.create(
-            model=model_choice,
+        # Use the OpenAI wrapper for robust handling
+        wrapper = get_openai_wrapper()
+        summary = wrapper.chat_completion(
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise library/tool/framework summaries."},
                 {"role": "user", "content": prompt}
             ],
+            model=model_choice,
             temperature=0.3,
             max_tokens=150
         )
-        
-        # Extract the generated summary
-        summary = response.choices[0].message.content.strip()
         
         # Ensure the summary is not too long
         if len(summary) > max_length:
